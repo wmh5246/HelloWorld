@@ -1,119 +1,271 @@
-#include <assert.h>
-#include <math.h>
-#include <stdint.h>
+// CMPSC 311 SU24
+// LAB 2
+// Wentao He
+// wmh5246@psu.edu
+
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
-#include "cache.h"
-#include "jbod.h"
 #include "mdadm.h"
+#include "jbod.h"
+#include "util.h"
 
-// Mounts the JBOD device
+static int mounted = 0;
+static int writable = 0;
+
+// create op code for jbod_operation
+static uint32_t create_op_code(uint32_t cmd, uint32_t disk_id, uint32_t block_id) {
+    uint32_t op_code = 0;
+    op_code |= (cmd & 0x3F);
+    op_code |= (disk_id & 0xF) << 6;
+    op_code |= (block_id & 0xFF) << 10;
+    return op_code;
+}
+
 int mdadm_mount(void) {
-    // Your implementation for mounting JBOD
-    return -1;
+    // check if already mounted
+    if (mounted) {
+        debug_log("Mount failed: already mounted\n");
+        return -1;
+    }
+    // mound the jbod
+    uint32_t op = create_op_code(JBOD_MOUNT, 0, 0);
+    int status = jbod_operation(op, NULL);
+    // check if mount successful
+    if (status == 0) {
+        mounted = 1;
+        debug_log("Mount successful\n");
+        return 1;
+    }
+    else {
+        debug_log("Mount failed\n");
+        return -1;
+    }
 }
 
-// Unmounts the JBOD device
-int mdadm_unmount(void) {
-    // Your implementation for unmounting JBOD
-    return -1;
+int mdadm_unmount(void)
+{
+    // check if already unmounted
+    if (!mounted) {
+        debug_log("Unmount failed: not mounted\n");
+        return -1;
+    }
+    // unmount the jbod
+    uint32_t op = create_op_code(JBOD_UNMOUNT, 0, 0);
+    int status = jbod_operation(op, NULL);
+    // check if unmount successful
+    if (status == 0) {
+        mounted = 0;
+        debug_log("Unmount successful\n");
+        return 1;
+    } else {
+        debug_log("Unmount failed\n");
+        return -1;
+    }
 }
 
-// Grants write permission to the JBOD device
-int mdadm_write_permission(void) {
-    // Your implementation for granting write permission
-    return -1;
-}
-
-// Revokes write permission from the JBOD device
-int mdadm_revoke_write_permission(void) {
-    // Your implementation for revoking write permission
-    return -1;
-}
-
-// Reads data from JBOD, using the cache if possible
-int mdadm_read(uint32_t addr, uint32_t len, uint8_t *buf) {
-    if (buf == NULL || len == 0 || len > 1024 || (addr + len) > 1048576) {
+int mdadm_read(uint32_t start_addr, uint32_t read_len, uint8_t *read_buf)
+{
+    // check if mounted
+    if (!mounted) {
+        debug_log("Read failed: not mounted\n");
+        return -1;
+    }
+    if (read_len == 0 && read_buf == NULL) {
+        debug_log("Read successful: 0-length read\n");
+        return 0;
+    }
+    // check if the parameters are valid
+    if ((start_addr + read_len) > JBOD_DISK_SIZE * JBOD_NUM_DISKS || read_len > 1024 || read_buf == NULL) {
+        debug_log("Read failed: invalid parameters\n");
         return -1;
     }
 
-    uint32_t current_addr = addr;
-    uint32_t remaining_len = len;
-    uint8_t temp_buf[JBOD_BLOCK_SIZE];
 
-    while (remaining_len > 0) {
-        uint32_t disk_num = current_addr / JBOD_DISK_SIZE;
-        uint32_t block_num = (current_addr % JBOD_DISK_SIZE) / JBOD_BLOCK_SIZE;
-        uint32_t block_offset = current_addr % JBOD_BLOCK_SIZE;
-        uint32_t bytes_to_read = JBOD_BLOCK_SIZE - block_offset;
-        if (bytes_to_read > remaining_len) {
-            bytes_to_read = remaining_len;
-        }
+    uint32_t total_block_count = start_addr / JBOD_BLOCK_SIZE;
+    uint32_t offset = start_addr % JBOD_BLOCK_SIZE;
+    uint32_t cur_disk = total_block_count / JBOD_NUM_BLOCKS_PER_DISK;
+    uint32_t cur_block = total_block_count % JBOD_NUM_BLOCKS_PER_DISK;
+    uint32_t bytes_left = read_len;
 
-        // Use cache if enabled and block is present
-        if (cache_enabled() && cache_lookup(disk_num, block_num, temp_buf) == 1) {
-            memcpy(buf, temp_buf + block_offset, bytes_to_read);
-        } else {
-            // Read block from JBOD if not in cache
-            if (jbod_client_operation(JBOD_READ_BLOCK, disk_num, block_num, temp_buf) != 0) {
+	// seek to the cur disk
+    uint32_t op = create_op_code(JBOD_SEEK_TO_DISK, cur_disk, 0);
+    int status = jbod_operation(op, NULL);
+    if (status != 0) {
+        debug_log("Read failed: seek error\n");
+        return -1;
+    }
+
+	// seek to the cur block
+    op = create_op_code(JBOD_SEEK_TO_BLOCK, 0, cur_block);
+    status = jbod_operation(op, NULL);
+    if (status != 0) {
+        debug_log("Read failed: seek error\n");
+        return -1;
+    }
+
+    while (bytes_left > 0) {
+		// if the current disk is full, move to the next disk
+        if (cur_block == JBOD_NUM_BLOCKS_PER_DISK) {
+            cur_disk++; cur_block = 0; // move to the next disk, block reset to 0
+            op = create_op_code(JBOD_SEEK_TO_DISK, cur_disk, 0);
+            status = jbod_operation(op, NULL);
+            if (status != 0) {
+                debug_log("Read failed: seek error\n");
                 return -1;
             }
-            // Insert block into cache if enabled
-            if (cache_enabled()) {
-                cache_insert(disk_num, block_num, temp_buf);
+            op = create_op_code(JBOD_SEEK_TO_BLOCK, 0, cur_block);
+            status = jbod_operation(op, NULL);
+            if (status != 0) {
+                debug_log("Read failed: seek error\n");
+                return -1;
             }
-            memcpy(buf, temp_buf + block_offset, bytes_to_read);
         }
 
-        current_addr += bytes_to_read;
-        buf += bytes_to_read;
-        remaining_len -= bytes_to_read;
+        // calculate the bytes to read
+        uint32_t bytes_to_read = (JBOD_BLOCK_SIZE - offset > bytes_left) ? 
+                                    bytes_left : JBOD_BLOCK_SIZE - offset;
+		// read the block
+        char temp_buf[JBOD_BLOCK_SIZE];
+        if (cache_enabled() && cache_lookup(cur_disk, cur_block, (uint8_t*)temp_buf) == 1) {
+            debug_log("Cache hit\n");
+        } else {
+            op = create_op_code(JBOD_READ_BLOCK, 0, 0);
+            int status = jbod_operation(op, (uint8_t*)temp_buf);
+            if (status != 0) {
+                debug_log("Read failed: read error\n");
+                return -1;
+            }
+            if (cache_enabled()) {
+                cache_insert(cur_disk, cur_block, (uint8_t*)temp_buf);
+            }
+        }
+        
+		// copy the content to read_buf
+        for (int i = 0; i < bytes_to_read; i++) {
+            read_buf[read_len - bytes_left + i] = temp_buf[offset + i];
+        }
+        // move to the next block
+        cur_block++;
+        bytes_left -= bytes_to_read;
+        offset = (offset + bytes_to_read) % JBOD_BLOCK_SIZE;
     }
 
-    return len;
+    debug_log("Read successful\n");
+    return read_len;
 }
 
-// Writes data to JBOD, updating the cache if enabled
-int mdadm_write(uint32_t addr, uint32_t len, const uint8_t *buf) {
-    if (buf == NULL || len == 0 || len > 1024 || (addr + len) > 1048576) {
+int mdadm_write_permission(void){
+    writable = 1;
+    int status = jbod_operation(JBOD_WRITE_PERMISSION, NULL);
+    return status;
+}
+
+
+int mdadm_revoke_write_permission(void){
+    writable = 0;
+    int status = jbod_operation(JBOD_REVOKE_WRITE_PERMISSION, NULL);
+	return status;
+}
+
+
+int mdadm_write(uint32_t start_addr, uint32_t write_len, const uint8_t *write_buf) {
+    // check if mounted and writable
+	if (!mounted || !writable) {
         return -1;
     }
 
-    uint32_t current_addr = addr;
-    uint32_t remaining_len = len;
-    uint8_t temp_buf[JBOD_BLOCK_SIZE];
-
-    while (remaining_len > 0) {
-        uint32_t disk_num = current_addr / JBOD_DISK_SIZE;
-        uint32_t block_num = (current_addr % JBOD_DISK_SIZE) / JBOD_BLOCK_SIZE;
-        uint32_t block_offset = current_addr % JBOD_BLOCK_SIZE;
-        uint32_t bytes_to_write = JBOD_BLOCK_SIZE - block_offset;
-        if (bytes_to_write > remaining_len) {
-            bytes_to_write = remaining_len;
-        }
-
-        // Read block from JBOD before writing to it
-        if (jbod_client_operation(JBOD_READ_BLOCK, disk_num, block_num, temp_buf) != 0) {
-            return -1;
-        }
-        // Modify the block with the new data
-        memcpy(temp_buf + block_offset, buf, bytes_to_write);
-
-        // Write the modified block back to JBOD
-        if (jbod_client_operation(JBOD_WRITE_BLOCK, disk_num, block_num, temp_buf) != 0) {
-            return -1;
-        }
-        // Update the cache with the new block if enabled
-        if (cache_enabled()) {
-            cache_update(disk_num, block_num, temp_buf);
-        }
-
-        current_addr += bytes_to_write;
-        buf += bytes_to_write;
-        remaining_len -= bytes_to_write;
+    if (write_len == 0 && write_buf == NULL) {
+        return 0;
+    }
+    // check if the parameters are valid
+    if ((start_addr + write_len) > JBOD_DISK_SIZE * JBOD_NUM_DISKS || write_len > 1024 || write_buf == NULL) {
+        return -1;
     }
 
-    return len;
+    uint32_t total_block_count = start_addr / JBOD_BLOCK_SIZE;
+    uint32_t offset = start_addr % JBOD_BLOCK_SIZE;
+    uint32_t cur_disk = total_block_count / JBOD_NUM_BLOCKS_PER_DISK;
+    uint32_t cur_block = total_block_count % JBOD_NUM_BLOCKS_PER_DISK;
+    uint32_t bytes_left = write_len;
+
+    // seek to the cur disk
+    uint32_t op = create_op_code(JBOD_SEEK_TO_DISK, cur_disk, 0);
+    int status = jbod_operation(op, NULL);
+    if (status != 0) {
+        debug_log("Read failed: seek error\n");
+        return -1;
+    }
+    // seek to the cur block
+    op = create_op_code(JBOD_SEEK_TO_BLOCK, 0, cur_block);
+    status = jbod_operation(op, NULL);
+    if (status != 0) {
+        debug_log("Read failed: seek error\n");
+        return -1;
+    }
+
+    while (bytes_left > 0) {
+        // if the current disk is full, move to the next disk
+        if (cur_block == JBOD_NUM_BLOCKS_PER_DISK) {
+            cur_disk++; cur_block = 0;
+            op = create_op_code(JBOD_SEEK_TO_DISK, cur_disk, 0);
+            status = jbod_operation(op, NULL);
+            if (status != 0) {
+                debug_log("Read failed: seek error\n");
+                return -1;
+            }
+            op = create_op_code(JBOD_SEEK_TO_BLOCK, 0, cur_block);
+            status = jbod_operation(op, NULL);
+            if (status != 0) {
+                debug_log("Read failed: seek error\n");
+                return -1;
+            }
+        }
+        // calculate the bytes to write
+        uint32_t bytes_to_write = (JBOD_BLOCK_SIZE - offset > bytes_left) ? 
+                                    bytes_left : JBOD_BLOCK_SIZE - offset;
+
+        // read the block to be written
+        char temp_buf[JBOD_BLOCK_SIZE];
+
+        op = create_op_code(JBOD_READ_BLOCK, 0, 0);
+        int status = jbod_operation(op, (uint8_t*)temp_buf);
+        if (status != 0) {
+            debug_log("Read failed: read error\n");
+            return -1;
+        }
+        if (cache_enabled()) {
+            int res = cache_insert(cur_disk, cur_block, (uint8_t*)temp_buf);
+            // update the cache if the block is already in the cache
+            if (res == -1) cache_update(cur_disk, cur_block, (uint8_t*)temp_buf); 
+        }
+        // write the target content to temp_buf
+        for (int i = 0; i < bytes_to_write; i++) {
+            temp_buf[offset + i] = write_buf[write_len - bytes_left + i];
+        }
+
+        // seek to the target block (block_no increment 1 after each write)
+        op = create_op_code(JBOD_SEEK_TO_BLOCK, 0, cur_block);
+        status = jbod_operation(op, NULL);
+        if (status != 0) {
+            debug_log("Write failed: seek error\n");
+            return -1;
+        }
+        // write the block
+        op = create_op_code(JBOD_WRITE_BLOCK, 0, 0);
+        status = jbod_operation(op, (uint8_t*)temp_buf);
+        if (status != 0) {
+            debug_log("Read failed: read error\n");
+            return -1;
+        }
+        // move to the next block
+        cur_block++;
+        bytes_left -= bytes_to_write;
+        offset = (offset + bytes_to_write) % JBOD_BLOCK_SIZE;
+    }
+    return write_len;
 }
+
